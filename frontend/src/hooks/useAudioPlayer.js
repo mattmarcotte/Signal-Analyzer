@@ -1,12 +1,19 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
 export const DEFAULT_FILTERS = [
-  { id: 'lowpass',  label: 'Low Pass',  type: 'lowpass',  frequency: 2000, Q: 1,  enabled: false, description: 'Cuts frequencies above the cutoff' },
-  { id: 'highpass', label: 'High Pass', type: 'highpass', frequency: 500,  Q: 1,  enabled: false, description: 'Cuts frequencies below the cutoff' },
-  { id: 'bandpass', label: 'Band Pass', type: 'bandpass', frequency: 1000, Q: 2,  enabled: false, description: 'Passes a band around the center frequency' },
-  { id: 'notch',    label: 'Notch',     type: 'notch',    frequency: 1000, Q: 10, enabled: false, description: 'Removes a narrow band of frequencies' },
-  { id: 'peaking',  label: 'Peaking EQ', type: 'peaking', frequency: 1000, Q: 1,  gain: 6, enabled: false, description: 'Boosts or cuts a frequency band' },
+  { id: 'lowpass',   label: 'Low Pass',   type: 'lowpass',  frequency: 2000, Q: 1,  enabled: false, description: 'Cuts frequencies above the cutoff' },
+  { id: 'highpass',  label: 'High Pass',  type: 'highpass', frequency: 500,  Q: 1,  enabled: false, description: 'Cuts frequencies below the cutoff' },
+  { id: 'bandpass',  label: 'Band Pass',  type: 'bandpass', low: 500, high: 2000,   enabled: false, description: 'Only lets a frequency band through' },
+  { id: 'banddrop',  label: 'Band Drop',  type: 'notch',    low: 900, high: 1100,   enabled: false, description: 'Removes a frequency band from the signal' },
+  { id: 'peaking',   label: 'Peaking EQ', type: 'peaking',  frequency: 1000, Q: 1, gain: 6, enabled: false, description: 'Boosts or cuts a frequency band' },
 ]
+
+// Derive Web Audio center frequency and Q from a low/high Hz band
+function bandToFilterParams(low, high) {
+  const center = Math.sqrt(low * high)         // geometric mean
+  const Q = center / Math.max(high - low, 1)
+  return { frequency: center, Q }
+}
 
 export function useAudioPlayer() {
   const [audioBuffer, setAudioBuffer] = useState(null)
@@ -67,12 +74,10 @@ export function useAudioPlayer() {
 
     stopSource()
 
-    // Build source
     const source = ctx.createBufferSource()
     source.buffer = audioBuffer
     source.detune.value = pitchSemitones * 100
 
-    // Build filter chain
     const activeFilters = filters.filter(f => f.enabled)
     const gainNode = ctx.createGain()
     gainNode.gain.value = volume
@@ -82,9 +87,18 @@ export function useAudioPlayer() {
     for (const f of activeFilters) {
       const node = ctx.createBiquadFilter()
       node.type = f.type
-      node.frequency.value = f.frequency
-      node.Q.value = f.Q
-      if (f.gain !== undefined) node.gain.value = f.gain
+
+      if (f.low !== undefined && f.high !== undefined) {
+        // Band-style filter: derive center/Q from low/high
+        const { frequency, Q } = bandToFilterParams(f.low, f.high)
+        node.frequency.value = frequency
+        node.Q.value = Q
+      } else {
+        node.frequency.value = f.frequency
+        node.Q.value = f.Q
+        if (f.gain !== undefined) node.gain.value = f.gain
+      }
+
       lastNode.connect(node)
       lastNode = node
     }
@@ -145,7 +159,6 @@ export function useAudioPlayer() {
     if (isPlaying) startPlayback(clamped)
   }, [isPlaying, duration, startPlayback])
 
-  // Volume change: update live gain node if playing
   const changeVolume = useCallback((val) => {
     setVolume(val)
     if (gainNodeRef.current) gainNodeRef.current.gain.value = val
@@ -164,6 +177,45 @@ export function useAudioPlayer() {
     setPitchSemitones(0)
   }, [])
 
+  // Render the full audio buffer through the active filter chain offline (no playback).
+  // Returns an AudioBuffer of the processed signal, or null if no effects are active.
+  const renderFiltered = useCallback(async () => {
+    if (!audioBuffer) return null
+    const activeFilters = filters.filter(f => f.enabled)
+    if (activeFilters.length === 0 && pitchSemitones === 0) return null
+
+    // Account for pitch shift changing duration
+    const pitchFactor = Math.pow(2, pitchSemitones / 12)
+    const outputLength = Math.ceil(audioBuffer.length / pitchFactor)
+
+    const offlineCtx = new OfflineAudioContext(1, outputLength, audioBuffer.sampleRate)
+
+    const source = offlineCtx.createBufferSource()
+    source.buffer = audioBuffer
+    source.detune.value = pitchSemitones * 100
+
+    let lastNode = source
+    for (const f of activeFilters) {
+      const node = offlineCtx.createBiquadFilter()
+      node.type = f.type
+      if (f.low !== undefined && f.high !== undefined) {
+        const { frequency, Q } = bandToFilterParams(f.low, f.high)
+        node.frequency.value = frequency
+        node.Q.value = Q
+      } else {
+        node.frequency.value = f.frequency
+        node.Q.value = f.Q
+        if (f.gain !== undefined) node.gain.value = f.gain
+      }
+      lastNode.connect(node)
+      lastNode = node
+    }
+    lastNode.connect(offlineCtx.destination)
+    source.start(0)
+
+    return await offlineCtx.startRendering()
+  }, [audioBuffer, filters, pitchSemitones])
+
   useEffect(() => {
     return () => {
       stopSource()
@@ -173,6 +225,7 @@ export function useAudioPlayer() {
 
   return {
     audioBuffer,
+    renderFiltered,
     isPlaying,
     currentTime,
     duration,

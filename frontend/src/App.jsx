@@ -3,12 +3,34 @@ import * as Tabs from '@radix-ui/react-tabs'
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts'
-import { Upload, Loader2, Activity, BarChart2, Gauge, Waveform } from 'lucide-react'
+import { Upload, Loader2, Activity, BarChart2, Gauge, Moon, Sun } from 'lucide-react'
 import { useAudioPlayer } from './hooks/useAudioPlayer'
 import { AudioPlayer } from './components/AudioPlayer'
 import { EffectsPanel } from './components/EffectsPanel'
 
 const API_URL = import.meta.env.VITE_API_URL || ''
+
+// Encode an AudioBuffer (mono) as a 16-bit PCM WAV Blob
+function audioBufferToWav(buffer) {
+  const samples = buffer.getChannelData(0)
+  const sampleRate = buffer.sampleRate
+  const wavBuf = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(wavBuf)
+  const str = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)) }
+  str(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true)
+  str(8, 'WAVE'); str(12, 'fmt ')
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true)
+  str(36, 'data'); view.setUint32(40, samples.length * 2, true)
+  let off = 44
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
+    off += 2
+  }
+  return new Blob([wavBuf], { type: 'audio/wav' })
+}
 
 function fmt2(n) {
   return typeof n === 'number' ? n.toFixed(2) : '—'
@@ -126,12 +148,19 @@ function SNRTab({ data }) {
 export default function App() {
   const [file, setFile] = useState(null)
   const [results, setResults] = useState(null)
+  const [filteredAnalysis, setFilteredAnalysis] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [dragging, setDragging] = useState(false)
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('darkMode') === 'true')
   const fileInputRef = useRef(null)
 
   const player = useAudioPlayer()
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', darkMode)
+    localStorage.setItem('darkMode', darkMode)
+  }, [darkMode])
 
   const handleFile = useCallback((f) => {
     if (!f) return
@@ -162,7 +191,25 @@ export default function App() {
     setLoading(true)
     setError(null)
     setResults(null)
-    const makeFormData = () => { const fd = new FormData(); fd.append('file', file); return fd }
+    setFilteredAnalysis(false)
+
+    // If active effects, render filtered audio offline and send that instead
+    let analysisFile = file
+    const hasEffects = player.filters.some(f => f.enabled) || player.pitchSemitones !== 0
+    if (hasEffects && player.audioBuffer) {
+      try {
+        const rendered = await player.renderFiltered()
+        if (rendered) {
+          const wav = audioBufferToWav(rendered)
+          analysisFile = new File([wav], 'filtered.wav', { type: 'audio/wav' })
+          setFilteredAnalysis(true)
+        }
+      } catch (err) {
+        console.warn('Could not render filtered audio, falling back to original:', err)
+      }
+    }
+
+    const makeFormData = () => { const fd = new FormData(); fd.append('file', analysisFile); return fd }
     try {
       const [fftRes, spectRes, snrRes] = await Promise.all([
         fetch(`${API_URL}/analyze/fft`, { method: 'POST', body: makeFormData() }),
@@ -194,14 +241,21 @@ export default function App() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b border-border bg-card px-6 py-4 sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto flex items-center gap-3">
+        <div className="max-w-[1600px] mx-auto flex items-center gap-3">
           <Activity className="h-5 w-5 text-primary" />
           <h1 className="text-lg font-bold tracking-tight">Signal Analyzer</h1>
           <span className="text-xs text-muted-foreground bg-secondary rounded-full px-2 py-0.5">v1.0.0</span>
+          <button
+            onClick={() => setDarkMode(d => !d)}
+            className="ml-auto inline-flex items-center justify-center h-8 w-8 rounded-lg border border-border bg-background hover:bg-muted transition-colors"
+            title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </button>
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+      <main className="max-w-[1600px] mx-auto px-6 py-8 space-y-6">
 
         {/* Upload */}
         <section className="space-y-3">
@@ -235,8 +289,8 @@ export default function App() {
 
         {/* Player + Effects — shown when an audio file is loaded */}
         {isAudioFile && player.audioBuffer && (
-          <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="space-y-4">
+          <section className="grid grid-cols-1 xl:grid-cols-[320px_1fr] gap-6 items-start">
+            <div className="space-y-3">
               <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Audio</h2>
               <AudioPlayer
                 isPlaying={player.isPlaying}
@@ -255,7 +309,7 @@ export default function App() {
                 </div>
               )}
             </div>
-            <div className="space-y-4">
+            <div className="space-y-3">
               <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Signal Processing</h2>
               <EffectsPanel
                 filters={player.filters}
@@ -297,7 +351,14 @@ export default function App() {
         {/* Results */}
         {results && (
           <section className="space-y-4">
-            <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Analysis Results</h2>
+            <div className="flex items-center gap-3">
+              <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Analysis Results</h2>
+              {filteredAnalysis && (
+                <span className="inline-flex items-center rounded-full bg-emerald-100 dark:bg-emerald-900/40 px-2.5 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700">
+                  Filtered signal
+                </span>
+              )}
+            </div>
             <Tabs.Root defaultValue="fft" className="space-y-4">
               <Tabs.List className="flex gap-1 rounded-lg bg-muted p-1 w-fit">
                 {[
